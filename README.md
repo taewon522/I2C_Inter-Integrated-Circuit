@@ -3,14 +3,14 @@
 <p align="center">
   <img alt="I2C" src="https://img.shields.io/badge/bus-I2C-blue">
   <img alt="RTL" src="https://img.shields.io/badge/language-SystemVerilog-orange">
-  <img alt="ADDR" src="https://img.shields.io/badge/address-7bit-informational">
-  <img alt="FSM" src="https://img.shields.io/badge/FSM-START%2FADDR%2FDATA%2FACK%2FSTOP-green">
+  <img alt="OpenDrain" src="https://img.shields.io/badge/line-Open--Drain%20%2B%20Pull--Up-green">
+  <img alt="FSM" src="https://img.shields.io/badge/FSM-Master%2FSlave%20FSM-purple">
 </p>
 
 > **What this is**  
-> 내부 제어 신호(`I2C_En / I2C_start / I2C_stop / length / addr / tx_data`)를 입력으로 받아  
-> I2C 프로토콜(START/STOP, Address+R/W, ACK/NACK, Data)을 생성하는 **I2C Master**와,  
-> 버스에서 START/STOP을 감지하고 Address match 시 ACK 및 READ/WRITE를 수행하는 **I2C Slave** RTL입니다.
+> I2C(2-wire) 버스에서 **Master 1개 + Slave 1개**를 RTL(SystemVerilog)로 구현한 프로젝트입니다.  
+> Master는 **START/STOP, Address(7b)+R/W, ACK/NACK, Write/Read, Burst(length)**를 생성하고,  
+> Slave는 **START/STOP 검출(동기화+엣지검출), Address match, ACK 응답, Write 수신 / Read 송신**을 수행합니다.
 
 ---
 
@@ -18,31 +18,25 @@
 
 - [DESIGN SPEC](#design-spec)
   - [1. Overview](#1-overview)
-  - [2. Protocol Summary](#2-protocol-summary)
+  - [2. I2C Basics (Protocol Summary)](#2-i2c-basics-protocol-summary)
   - [3. Interfaces](#3-interfaces)
-    - [3.1 I2C_MASTER Ports](#31-i2c_master-ports)
-    - [3.2 I2C_SLAVE Ports](#32-i2c_slave-ports)
-  - [4. Master FSM & Behavior](#4-master-fsm--behavior)
-    - [4.1 States](#41-states)
-    - [4.2 Transaction Flow](#42-transaction-flow)
-    - [4.3 Length (Burst) Rule](#43-length-burst-rule)
-  - [5. Slave FSM & Behavior](#5-slave-fsm--behavior)
-    - [5.1 Address / ACK / READ-WRITE](#51-address--ack--read-write)
-    - [5.2 Repeated START / STOP Detection](#52-repeated-start--stop-detection)
-  - [6. Key Assumptions / Limitations](#6-key-assumptions--limitations)
+  - [4. Timing & Bit Transfer Rule](#4-timing--bit-transfer-rule)
+  - [5. Master FSM & Behavior](#5-master-fsm--behavior)
+  - [6. Slave FSM & Behavior](#6-slave-fsm--behavior)
+  - [7. Key Assumptions / Limitations](#7-key-assumptions--limitations)
 
 - [VERIFICATION SPEC](#verification-spec)
-  - [7. Verification Requirements (Shall)](#7-verification-requirements-shall)
-  - [8. Assertions (SVA) Checklist](#8-assertions-sva-checklist)
-  - [9. Functional Coverage](#9-functional-coverage)
-  - [10. Test Plan](#10-test-plan)
+  - [8. Verification Requirements (Shall)](#8-verification-requirements-shall)
+  - [9. Assertions (SVA) Checklist](#9-assertions-sva-checklist)
+  - [10. Functional Coverage](#10-functional-coverage)
+  - [11. Test Plan](#11-test-plan)
 
 - [IMPLEMENTATION](#implementation)
-  - [11. RTL Code](#11-rtl-code)
+  - [12. RTL Code](#12-rtl-code)
+  - [13. Block Diagrams (Optional)](#13-block-diagrams-optional)
 
-- [DOC / REFERENCES](#doc--references)
-  - [12. My Docs (Images)](#12-my-docs-images)
-  - [13. Public References](#13-public-references)
+- [DOC](#doc)
+  - [14. References](#14-references)
 
 ---
 
@@ -50,256 +44,839 @@
 
 ## 1. Overview
 
-**Modules**
-- `I2C_MASTER.sv` : I2C Master (SCL 생성 + SDA 구동/해제 + ACK/NACK 처리 + Burst length)
-- `I2C_SLAVE.sv`  : I2C Slave  (START/STOP 감지 + 주소 수신 + ACK + READ/WRITE 데이터 처리)
+### 1.1 Modules
+- **I2C Master**: `I2C_MASTER.sv`
+- **I2C Slave**:  `I2C_SLAVE.sv`
 
-**Bus Signals**
-- `SCL` : Master가 생성하는 Clock
-- `SDA` : Data line (tri-state 사용)
+### 1.2 Feature Summary (based on RTL)
+**Master**
+- START/STOP 생성
+- 7-bit Address + R/W(=CR_RW) 전송
+- ACK 샘플링(ACK=0 성공)
+- Write: 데이터 전송 + ACK 확인
+- Read: 데이터 수신 + ACK/NACK 생성
+- Burst(length): length 값 기준으로 연속 byte 처리
 
-**Reset**
-- 두 모듈 모두 `posedge reset` 기반 (active-high, async 스타일)
+**Slave**
+- SDA/SCL 입력 동기화(2FF) + 엣지 검출로 START/STOP 감지
+- Address 수신 후 match 시 ACK 구동
+- Write 시 데이터 수신 + ACK 구동
+- Read 시 데이터 송신, Master ACK 기반으로 burst_read 유지(ACK=0이면 연속 송신)
 
 ---
 
-## 2. Protocol Summary
+## 2. I2C Basics (Protocol Summary)
 
-I2C 기본 규칙(요약):
-- **START**: `SCL=HIGH`에서 `SDA: 1→0`
-- **STOP** : `SCL=HIGH`에서 `SDA: 0→1`
-- **Data Valid**: 일반 데이터는 `SCL=HIGH` 구간에서 SDA 안정(stable)  
-  (데이터 변경은 `SCL=LOW`에서, 단 START/STOP 예외)
-- **ACK/NACK**: 8비트 전송 후 9번째 클럭에서 ACK(0)/NACK(1)
+### 2.1 2-wire bus
+- **SCL**: Clock
+- **SDA**: Data
+- 라인은 기본적으로 **Pull-up**에 의해 HIGH가 되고, 디바이스는 **LOW만 당기는(Open-Drain)** 방식
+
+### 2.2 Start / Stop condition
+- **START**: SCL=HIGH 동안 SDA가 **1→0**
+- **STOP** : SCL=HIGH 동안 SDA가 **0→1**
+
+### 2.3 Bit transfer rule
+- 일반 데이터 비트는 **SCL=HIGH 구간에서 SDA가 안정(stable)** 해야 함
+- SDA 변경은 **SCL=LOW 구간**에서만 (START/STOP 예외)
+
+### 2.4 Frame (7-bit Address)
+- `ADDR[6:0] + R/W(1bit)` 총 8비트 전송
+- 다음 9번째 클럭에서 ACK/NACK
+  - **ACK=0**: 수신 성공
+  - **NACK=1**: 거부/종료
 
 ---
 
 ## 3. Interfaces
 
-### 3.1 I2C_MASTER Ports
+## 3.1 I2C Master (`I2C_MASTER.sv`)
 
+### Global
+- `clk` : system clock
+- `reset` : async reset (posedge reset)
+
+### Internal control/data
 | Signal | Dir | Width | Description |
 |---|---:|---:|---|
-| `clk` | in | 1 | system clock |
-| `reset` | in | 1 | active-high reset |
-| `I2C_En` | in | 1 | 트랜잭션 시작(Enable) |
+| `I2C_En` | in | 1 | transaction 시작 요청 |
 | `addr` | in | 7 | 7-bit slave address |
 | `CR_RW` | in | 1 | 0=WRITE, 1=READ |
-| `tx_data` | in | 8 | WRITE data byte |
-| `tx_done` | out | 1 | 바이트 단위 전송 완료 pulse |
-| `tx_ready` | out | 1 | IDLE에서 1 (시작 가능) |
-| `rx_data` | out | 8 | READ data byte |
-| `rx_done` | out | 1 | 바이트 단위 수신 완료 pulse |
-| `I2C_start` | in | 1 | HOLD/HOLD2에서 다음 동작 트리거(continue / repeated start) |
-| `I2C_stop` | in | 1 | HOLD에서 STOP 트리거 |
-| `length` | in | `$clog2(D_LENGTH)+1` | Burst length(바이트 개수) |
-| `SCL` | out | 1 | I2C clock |
-| `SDA` | inout | 1 | I2C data (tri-state) |
+| `tx_data` | in | 8 | write data byte |
+| `tx_done` | out | 1 | write byte done tick |
+| `tx_ready` | out | 1 | IDLE 상태에서 1 (ready) |
+| `rx_data` | out | 8 | read data byte |
+| `rx_done` | out | 1 | read byte done tick |
+| `I2C_start` | in | 1 | HOLD/HOLD2에서 다음 데이터/재시작 제어 |
+| `I2C_stop` | in | 1 | HOLD에서 STOP 제어 |
+| `length` | in | clog2(D_LENGTH)+1 | burst length (byte count) |
 
-**Request Acceptance Rule**
-- `I2C_En==1`이 **IDLE에서** 들어오면 START부터 진행
-- 주소 프레임은 내부에서 `{addr, CR_RW}`로 자동 구성
+### External
+- `SCL` : output clock
+- `SDA` : inout data (open-drain 스타일로 tri-state)
 
 ---
 
-### 3.2 I2C_SLAVE Ports
+## 3.2 I2C Slave (`I2C_SLAVE.sv`)
 
+### Global
+- `clk`, `reset`
+
+### Internal
 | Signal | Dir | Width | Description |
 |---|---:|---:|---|
-| `clk` | in | 1 | system clock |
-| `reset` | in | 1 | active-high reset |
-| `tx_data` | in | 8 | READ 요청 시 Slave가 내보낼 데이터 |
-| `tx_done` | out | 1 | 바이트 송신 완료 pulse |
-| `tx_ready` | out | 1 | (현재 RTL에서 의미 거의 없음/미사용) |
-| `rx_data` | out | 8 | WRITE로 수신한 데이터 |
-| `rx_done` | out | 1 | 바이트 수신 완료 pulse |
-| `scl` | in | 1 | I2C clock |
-| `sda` | inout | 1 | I2C data (tri-state) |
+| `tx_data` | in | 8 | slave가 READ 응답으로 내보낼 데이터 |
+| `tx_done` | out | 1 | byte 송신 완료 tick |
+| `tx_ready` | out | 1 | (현재 RTL에서 실사용/구동 미흡: 개선 여지) |
+| `rx_data` | out | 8 | master가 WRITE로 보낸 데이터 수신 |
+| `rx_done` | out | 1 | byte 수신 완료 tick |
 
-**Slave Address**
-- 현재 RTL 고정: `7'b1111110 (0x7E)`
-- 포트폴리오 버전에서는 parameter화 추천
+### External
+- `scl` : input SCL
+- `sda` : inout SDA
 
 ---
 
-## 4. Master FSM & Behavior
+## 4. Timing & Bit Transfer Rule
 
-### 4.1 States
+### 4.1 Master SCL generation (based on RTL)
+Master는 `clk_counter`와 `data_cnt`로 SCL을 토글합니다.
 
-`I2C_MASTER`는 아래 상태로 구성됩니다.
+- `clk_counter`가 0→249까지 카운트될 때마다 sub-phase 진행
+- `data_cnt`가 **0 또는 2**일 때 SCL 토글
+- 결과적으로 SCL의 1주기 ≈ **1000 * clk_period**
 
-- `ST_IDLE`      : `tx_ready=1`, `I2C_En` 대기
-- `ST_START1/2`  : START 조건 생성(SDA↓ while SCL=1)
-- `ST_WRITE`     : 바이트 송신(ADDR 또는 DATA)
-- `ST_ACK`       : Address ACK 샘플링 + 다음 동작 분기
-- `ST_WRITE_ACK` : Data ACK 샘플링 + 다음 바이트/종료 분기
-- `ST_READ`      : 바이트 수신(SDA 샘플링)
-- `ST_READ_ACK`  : Master가 ACK/NACK 구동(마지막 바이트면 NACK)
-- `ST_HOLD2`     : 다음 tx_data 로딩 대기 (`I2C_start`로 진행)
-- `ST_HOLD`      : STOP 또는 repeated START 선택
-- `ST_STOP1/2`   : STOP 생성
+> 즉, SCL 주파수는 대략 `F_SCL ≈ F_CLK / 1000` (코드 구조 기준)
 
-> 내부 구현은 `clk_counter(249/499)`와 `data_cnt(0~3)`로 SCL 토글/샘플 구간을 분할해 타이밍을 만듭니다.
+### 4.2 SDA direction (tri-state)
+- Master: ACK 수신 / READ 구간에서는 SDA를 `Z`로 두고 샘플
+- Slave: ACK 송신 / DATA 송신 구간에서만 SDA drive
 
 ---
 
-### 4.2 Transaction Flow
+## 5. Master FSM & Behavior
 
-#### (A) WRITE 흐름 (Master → Slave)
-1. `IDLE`에서 `I2C_En=1`  
-2. START 생성 (`ST_START1/2`)
-3. Address frame `{addr, CR_RW=0}` 송신 (`ST_WRITE`)
-4. Address ACK 확인 (`ST_ACK`)
-5. 데이터 전송은 `ST_HOLD2`에서 `I2C_start`를 받아 `tx_data` 로딩 후 `ST_WRITE`로 진행
-6. 매 바이트 후 ACK 확인 (`ST_WRITE_ACK`)
-7. `length_reg==0`이면 `ST_HOLD`로 이동 → `I2C_stop`이면 STOP
+### 5.1 States (from RTL)
+- `ST_IDLE`
+- `ST_START1`, `ST_START2`
+- `ST_WRITE`
+- `ST_ACK` (Address ACK)
+- `ST_WRITE_ACK` (Data ACK)
+- `ST_READ`
+- `ST_READ_ACK` (Master ACK/NACK)
+- `ST_HOLD`, `ST_HOLD2` (STOP or RESTART or next byte control)
+- `ST_STOP1`, `ST_STOP2`
 
-#### (B) READ 흐름 (Slave → Master)
-1. `IDLE`에서 `I2C_En=1`
-2. START 생성
-3. Address frame `{addr, CR_RW=1}` 송신
-4. Address ACK 확인 후 `ST_READ`
-5. 8비트 수신 완료 후 `ST_READ_ACK`에서 ACK/NACK 생성  
-   - 마지막 바이트(`length_reg==0`)면 **NACK**
-6. `ST_HOLD`로 이동 → STOP 또는 repeated START 선택
+### 5.2 High-level flow
+**Address Phase**
+1) IDLE에서 `I2C_En=1` → START → `tx_data_reg={addr,CR_RW}` 전송  
+2) `ST_ACK`에서 ACK 샘플 (`ACK=0`이면 성공)
 
----
+**Write Flow (CR_RW=0)**
+- `ST_HOLD2`에서 `I2C_start=1` 시 `tx_data` 전송(`ST_WRITE`)
+- `ST_WRITE_ACK`에서 ACK 확인 후
+  - `length==0`이면 HOLD로 이동하여 STOP/RESTART 대기
+  - `length>0`이면 다음 byte를 위해 HOLD2로 이동
 
-### 4.3 Length (Burst) Rule
-
-- `length = N` : “데이터 바이트 N개” 전송/수신을 의미  
-- Address ACK 성공 시점부터 내부 `length_reg`가 감소하며 진행됩니다.
-- WRITE: 각 Data ACK 성공마다 `length_reg--`, 0이면 HOLD에서 종료 선택
-- READ : 각 byte 수신 후 `ST_READ_ACK`에서 `length_reg==0`이면 NACK 후 HOLD
-
-> 사용 팁: WRITE는 바이트마다 `I2C_start`로 “다음 바이트 진행” 트리거를 주는 구조(`HOLD2`)입니다.
-
----
-
-## 5. Slave FSM & Behavior
-
-### 5.1 Address / ACK / READ-WRITE
-
-Slave는 START 후 8비트(Address[7:1] + R/W[0])를 수신합니다.
-
-- Address match(`addr_reg[7:1]==7'b1111110`)이면 ACK(SDA=0)
-- R/W=0 : `RCV_DATA`로 들어가 WRITE 데이터 수신
-- R/W=1 : `SEND_DATA`로 들어가 READ 데이터 송신
-
-WRITE 수신:
-- 8비트 수신 후 ACK를 내보내고 다음 바이트 수신 대기
-
-READ 송신:
-- `tx_data`를 MSB-first로 송신
-- 8비트 송신 후 Master ACK를 샘플링(`RCV_ACK`)
-  - ACK(0)이면 다음 바이트 계속(Burst read)
-  - NACK(1)이면 종료 방향
+**Read Flow (CR_RW=1)**
+- `ST_READ`에서 SDA 샘플링으로 `rx_data_reg` shift-in
+- `ST_READ_ACK`에서
+  - 남은 length가 있으면 **ACK(0)**, 다음 byte 계속 READ
+  - 마지막이면 **NACK(1)** 후 HOLD로 이동
 
 ---
 
-### 5.2 Repeated START / STOP Detection
+## 6. Slave FSM & Behavior
 
-Slave는 동작 중에도 아래를 감지합니다.
-- `SCL=1 && SDA rising`  → STOP으로 판단
-- `SCL=1 && SDA falling` → repeated START로 판단하고 ADDR로 복귀
+### 6.1 Start/Stop detect
+동기화된 SDA/SCL 기준으로:
+- SCL=HIGH에서 SDA falling → START
+- SCL=HIGH에서 SDA rising → STOP
+
+### 6.2 Address handling
+- Address byte(8b) 수신 후 `addr_reg[7:1]` 비교
+- RTL 상 slave address는 고정:
+  - `slave_addr = 7'b1111110`
+
+### 6.3 Data handling
+- WRITE(R/W=0): `RCV_DATA`로 8비트 수신 후 `SEND_ACK_2`로 ACK
+- READ(R/W=1): `SEND_DATA`로 8비트 송신 후 `RCV_ACK`
+  - Master가 ACK(0)면 `burst_read` 유지하여 다음 byte 송신
+  - NACK(1)면 종료 방향(현 RTL은 STOP으로 강제 이동 대신 HOLD 형태: 개선 가능)
 
 ---
 
-## 6. Key Assumptions / Limitations
+## 7. Key Assumptions / Limitations
 
-- **Open-Drain 정확 모델링 한계**
-  - `SDA`는 tri-state를 쓰지만, 일부 구간에서 `O_SDA=1`로 직접 구동도 발생할 수 있음  
-  - 권장: 상위 TB에서 `pullup(sda)`를 추가하고, “LOW만 구동 / HIGH는 Z”로 정교화
-- **Clock stretching 미지원**, **multi-master arbitration 미지원**
-- **10-bit address 미지원** (7-bit only)
-- Slave address가 현재 고정(0x7E) → parameter화 추천
-- Slave의 burst read 종료 정책은 일부 주석 처리 구간이 있어(ACK 이후 STOP 처리) 개선 여지 있음
+- **Multi-master arbitration 미지원**
+- **Clock stretching 미지원**
+- **Pull-up 저항/라인 RC 모델은 RTL에서 직접 모델링하지 않음**  
+  (실제 HW에서는 외부 Pull-up 필수)
+- Slave address가 RTL에서 **고정값(7'b1111110)** (파라미터화 여지)
+- Slave의 `tx_ready`는 현재 RTL에서 적극적으로 사용되지 않음(정리/개선 여지)
 
 ---
 
 ## VERIFICATION SPEC
 
-## 7. Verification Requirements (Shall)
+## 8. Verification Requirements (Shall)
 
 | Req ID | Requirement (Shall) | Suggested Check Method |
 |---|---|---|
-| I2C-FR-001 | reset 시 Master/Slave는 IDLE로 복귀하고 내부 카운터/레지스터 초기화 | Directed + SVA |
-| I2C-FR-010 | Master는 `I2C_En`이 IDLE에서 1이면 START를 생성해야 함 | SVA + waveform |
-| I2C-FR-020 | START/STOP 조건은 SCL=HIGH 구간에서 SDA edge로 정의되어야 함 | SVA(temporal) |
-| I2C-FR-030 | Master는 `{addr, CR_RW}` 8비트를 MSB-first로 전송해야 함 | Scoreboard |
-| I2C-FR-040 | 9th clock에서 ACK/NACK를 샘플/생성해야 함 | SVA + Scoreboard |
-| I2C-FR-050 | WRITE: 각 바이트 전송 후 ACK 성공이면 length가 감소하고 다음 바이트 진행 가능해야 함 | Scoreboard |
-| I2C-FR-060 | READ: 각 바이트 수신 후 마지막 바이트면 NACK를 생성해야 함 | Scoreboard |
-| I2C-FR-070 | Slave는 address match 시 ACK를 생성해야 하며 mismatch면 transaction을 종료해야 함 | Directed |
-| I2C-FR-080 | repeated START 발생 시 Slave는 ADDR 수신으로 복귀해야 함 | Directed |
-| I2C-FR-090 | STOP 이후 버스가 idle(SCL=1,SDA=1) 상태로 복귀해야 함 | SVA |
+| I2C-FR-001 | reset 시 Master/Slave는 IDLE로 복귀하고 SDA/SCL을 idle 상태로 유지해야 함 | Directed + SVA |
+| I2C-FR-010 | START/STOP 조건을 I2C 정의대로 생성/검출해야 함 | Monitor + SVA |
+| I2C-FR-020 | Address(7b)+R/W 전송 후 9th clock에서 ACK 샘플링/응답을 수행해야 함 | Scoreboard + SVA |
+| I2C-FR-030 | WRITE: byte 전송 후 ACK 확인, burst length에 따라 연속 전송/종료를 수행해야 함 | Scoreboard |
+| I2C-FR-040 | READ: byte 수신 후 Master가 ACK/NACK을 생성하고 length 기반으로 연속 READ/종료를 수행해야 함 | Scoreboard |
+| I2C-FR-050 | SCL=HIGH 동안 SDA는 START/STOP을 제외하고 안정(stable)해야 함 | SVA |
+| I2C-FR-060 | Slave는 address match 시 ACK를 drive(LOW)하고 mismatch면 응답하지 않아야 함 | Directed + SVA |
+| I2C-FR-070 | Burst read에서 Slave는 Master ACK(0)일 때 다음 데이터를 이어서 송신해야 함 | Scoreboard |
 
 ---
 
-## 8. Assertions (SVA) Checklist
+## 9. Assertions (SVA) Checklist
 
-추천 SVA 체크리스트(요약):
+추천 assertion 아이디어(핵심만):
 
-- **A1**: Master `IDLE`에서 `I2C_En` → START 상태 진입
-- **A2**: START 조건: `SCL==1`일 때 `SDA 1->0`
-- **A3**: STOP 조건 : `SCL==1`일 때 `SDA 0->1`
-- **A4**: 데이터 비트 동안 `SCL==1` 구간에서 SDA 안정(stable) (START/STOP 제외)
-- **A5**: Address ACK 샘플은 9th clock에서만 수행
-- **A6**: READ 마지막 바이트는 NACK 생성 (`length_reg==0`이면 SDA=1 구동)
-- **A7**: Slave는 address mismatch면 ACK를 내지 않아야 함(또는 STOP로 전이)
-
-> 구현 팁: “SCL rising edge 카운트(8/9비트)” 기반 assertion이 제일 깔끔합니다.
+- **A1 (START)**: `SCL==1 && SDA`가 `1->0`이면 START로 판단
+- **A2 (STOP)** : `SCL==1 && SDA`가 `0->1`이면 STOP로 판단
+- **A3 (SDA stable when SCL high)**: START/STOP 제외하고 `SCL==1` 동안 `SDA` 변화 금지
+- **A4 (ACK timing)**: 9번째 비트에서 ACK는 `SCL==1` 구간에서 샘플되어야 함
+- **A5 (Open-drain rule)**: 어떤 디바이스도 SDA를 강제로 '1'로 밀지 않고, drive 시 0만 허용(모델링 정책에 따라)
 
 ---
 
-## 9. Functional Coverage
+## 10. Functional Coverage
 
-- **C1**: READ/WRITE 각각 hit
-- **C2**: length binning: 1,2,3,4+ 바이트
-- **C3**: ACK/NACK 케이스(ACK 성공, NACK/주소불일치)
-- **C4**: repeated START hit
-- **C5**: STOP hit
+- **C1**: R/W 분기 hit (WRITE/READ)
+- **C2**: Address match/mismatch
+- **C3**: ACK/NACK 케이스
+- **C4**: burst length binning (0, 1, 2, 4+)
+- **C5**: STOP vs RESTART 경로 hit
 
 ---
 
-## 10. Test Plan
+## 11. Test Plan
 
-- **T1**: reset sanity (SCL/SDA idle 확인)
-- **T2**: WRITE 1 byte (ACK 성공)
-- **T3**: WRITE N bytes (length>1, HOLD2 + I2C_start 반복)
-- **T4**: READ 1 byte (마지막 NACK 확인)
-- **T5**: READ N bytes (NACK가 마지막에서만 발생)
-- **T6**: address mismatch (Slave가 ACK 안 함/STOP 처리)
-- **T7**: repeated START 시나리오 (STOP 없이 START 재생성)
-- **T8**: STOP 타이밍/idle 복귀 확인
+- **T1**: reset sanity (master/slave idle)
+- **T2**: address match + 1-byte write
+- **T3**: address match + 1-byte read (NACK 종료)
+- **T4**: burst write (length=2/4)
+- **T5**: burst read (length=2/4) + master ACK 동작 확인
+- **T6**: address mismatch (slave ACK 없어야 함)
+- **T7**: restart 시나리오 (STOP 없이 repeated start)
 
 ---
 
 ## IMPLEMENTATION
 
-## 11. RTL Code
+## 12. RTL Code
 
 <details>
-  <summary><b>Click to expand RTL (I2C_MASTER / I2C_SLAVE)</b></summary>
+  <summary><b>Click to expand RTL (I2C_MASTER)</b></summary>
 
-> ✅ 아래에 `I2C_MASTER.sv`, `I2C_SLAVE.sv` 원문 코드를 그대로 붙이면 됩니다.
+```systemverilog
+`timescale 1ns / 1ps
+
+module I2C_MASTER #(
+    parameter D_LENGTH = 2
+) (
+    // global ports
+    input  logic                      clk,
+    input  logic                      reset,
+    // internal ports
+    input  logic                      I2C_En,
+    input  logic [               6:0] addr,
+    input  logic                      CR_RW,
+    input  logic [               7:0] tx_data,
+    output logic                      tx_done,
+    output logic                      tx_ready,
+    output logic [               7:0] rx_data,
+    output logic                      rx_done,
+    input  logic                      I2C_start,
+    input  logic                      I2C_stop,
+    input  logic [$clog2(D_LENGTH):0] length,
+    // external ports
+    output logic                      SCL,
+    inout  logic                      SDA
+);
+
+    logic [7:0] tx_data_reg, tx_data_next;
+    logic [7:0] rx_data_reg, rx_data_next;
+    logic tx_done_next, tx_done_reg;
+    logic rx_done_next, rx_done_reg;
+
+    logic [$clog2(D_LENGTH):0] length_next, length_reg;
+
+    logic SDA_EN;
+    logic O_SDA;
+    logic SCL_REG, SCL_NEXT;
+    logic addr_sig_reg, addr_sig_next;
+    logic ACK_LOW_REG, ACK_LOW_NEXT;
+
+    logic [$clog2(500)-1:0] clk_counter_reg, clk_counter_next;
+    logic [$clog2(4)-1:0] data_cnt_reg, data_cnt_next;
+    logic [$clog2(7)-1:0] bit_counter_reg, bit_counter_next;
+
+    assign tx_done = tx_done_reg;
+    assign rx_done = rx_done_reg;
+    assign rx_data = rx_data_reg;
+
+    assign SCL = SCL_REG;
+
+
+    typedef enum logic [3:0] {
+        ST_IDLE,
+        ST_START1,
+        ST_START2,
+        ST_WRITE,
+        ST_READ,  // slave -> master (read DATA)
+        ST_ACK,
+        ST_WRITE_ACK,
+        ST_READ_ACK,  // master -> slave (ACK/NACK)
+        ST_HOLD,
+        ST_HOLD2,
+        ST_STOP1,
+        ST_STOP2
+    } i2c_state_t;
+
+    i2c_state_t state, next_state;
+
+    assign SDA = (SDA_EN) ? O_SDA : 1'bz;
+
+    always_ff @(posedge clk, posedge reset) begin
+        if (reset) begin
+            state           <= ST_IDLE;
+            tx_data_reg     <= 8'h00;
+            rx_data_reg     <= 8'h00;
+            clk_counter_reg <= 0;
+            bit_counter_reg <= 0;
+            data_cnt_reg    <= 0;
+            tx_done_reg     <= 0;
+            rx_done_reg     <= 0;
+            SCL_REG         <= 1;
+            addr_sig_reg    <= 1;
+            ACK_LOW_REG     <= 0;
+            length_reg      <= 0;
+        end else begin
+            state           <= next_state;
+            tx_data_reg     <= tx_data_next;
+            rx_data_reg     <= rx_data_next;
+            clk_counter_reg <= clk_counter_next;
+            bit_counter_reg <= bit_counter_next;
+            data_cnt_reg    <= data_cnt_next;
+            tx_done_reg     <= tx_done_next;
+            rx_done_reg     <= rx_done_next;
+            SCL_REG         <= SCL_NEXT;
+            addr_sig_reg    <= addr_sig_next;
+            ACK_LOW_REG     <= ACK_LOW_NEXT;
+            length_reg      <= length_next;
+        end
+
+    end
+
+
+    always_comb begin
+        next_state       = state;
+        O_SDA            = 1'b1;
+        SCL_NEXT         = SCL_REG;
+        tx_data_next     = tx_data_reg;
+        rx_data_next     = rx_data_reg;
+        clk_counter_next = clk_counter_reg;
+        bit_counter_next = bit_counter_reg;
+        data_cnt_next    = data_cnt_reg;
+        tx_done_next     = 1'b0;
+        SDA_EN           = 1'b1;
+        tx_ready         = 1'b0;
+        rx_done_next     = 1'b0;
+        addr_sig_next    = addr_sig_reg;
+        ACK_LOW_NEXT     = ACK_LOW_REG;
+        length_next      = length_reg;
+        case (state)
+            ST_IDLE: begin
+                O_SDA    = 1'b1;
+                SCL_NEXT = 1'b1;
+                tx_ready = 1'b1;
+                if (I2C_En) begin
+                    next_state    = ST_START1;
+                    addr_sig_next = 1'b1;
+                    length_next   = length;
+                    tx_data_next  = {addr, CR_RW};
+                end
+            end
+            ST_HOLD2: begin
+                if (I2C_start && !I2C_stop) begin
+                    next_state   = ST_WRITE;
+                    tx_data_next = tx_data;
+                end
+            end
+            ST_HOLD: begin
+                if (!I2C_start && I2C_stop) begin
+                    SCL_NEXT   = 1;
+                    next_state = ST_STOP1;
+                end
+                if (I2C_start && !I2C_stop) begin
+                    SCL_NEXT      = 1;
+                    addr_sig_next = 1'b1;
+                    length_next   = length;
+                    tx_data_next  = {addr, CR_RW};
+                    next_state    = ST_START1;
+                end
+            end
+            ST_START1: begin
+                O_SDA = 0;
+                if (clk_counter_reg == 499) begin
+                    clk_counter_next = 0;
+                    SCL_NEXT = 0;
+                    next_state = ST_START2;
+                end else begin
+                    clk_counter_next = clk_counter_reg + 1;
+                end
+            end
+            ST_START2: begin
+                O_SDA = 0;
+                if (clk_counter_reg == 499) begin
+                    clk_counter_next = 0;
+                    SCL_NEXT         = 0;
+                    next_state       = ST_WRITE;
+                end else begin
+                    clk_counter_next = clk_counter_reg + 1;
+                end
+            end
+            ST_WRITE: begin
+                O_SDA = tx_data_reg[7];
+                if ((bit_counter_reg == 7) && (data_cnt_reg == 3)) begin
+                    SDA_EN = 1'b0;
+                end
+                if (clk_counter_reg == 249) begin
+                    SCL_NEXT = (data_cnt_reg == 0 || data_cnt_reg == 2) ? ~SCL_NEXT : SCL_NEXT;
+                    clk_counter_next = 0;
+                    if (data_cnt_reg == 3) begin
+                        data_cnt_next = 0;
+                        tx_data_next  = {tx_data_reg[6:0], 1'b0};
+                        if (bit_counter_reg == 7) begin
+                            bit_counter_next = 0;
+                            SCL_NEXT = 0;
+                            next_state = (addr_sig_reg) ? ST_ACK : ST_WRITE_ACK;
+                        end else begin
+                            bit_counter_next = bit_counter_reg + 1;
+                        end
+                    end else begin
+                        data_cnt_next = data_cnt_reg + 1;
+                    end
+                end else begin
+                    clk_counter_next = clk_counter_reg + 1;
+                end
+            end
+            ST_READ: begin
+                if ((bit_counter_reg == 7) && (data_cnt_reg == 3)) begin
+                    SDA_EN = 1'b1;
+                end else begin
+                    SDA_EN = 1'b0;
+                end
+                if (clk_counter_reg == 249) begin
+                    SCL_NEXT = (data_cnt_reg == 0 || data_cnt_reg == 2) ? ~SCL_NEXT : SCL_NEXT;
+                    clk_counter_next = 0;
+                    if (data_cnt_reg == 1) begin
+                        rx_data_next = {rx_data_reg[6:0], SDA};
+                    end
+                    if (data_cnt_reg == 3) begin
+                        data_cnt_next = 0;
+                        if (bit_counter_reg == 7) begin
+                            bit_counter_next = 0;
+                            SCL_NEXT         = 0;
+                            next_state       = ST_READ_ACK;
+                        end else begin
+                            bit_counter_next = bit_counter_reg + 1;
+                        end
+                    end else begin
+                        data_cnt_next = data_cnt_reg + 1;
+                    end
+                end else begin
+                    clk_counter_next = clk_counter_reg + 1;
+                end
+            end
+            ST_ACK: begin
+                SDA_EN = 1'b0;
+                if (clk_counter_reg == 249) begin
+                    SCL_NEXT = (data_cnt_reg == 0 || data_cnt_reg == 2) ? ~SCL_NEXT : SCL_NEXT;
+                    clk_counter_next = 0;
+                    if (data_cnt_reg == 3) begin
+                        data_cnt_next = 0;
+                        tx_done_next  = 1;
+                        if (!ACK_LOW_REG) begin
+                            next_state   = (length_reg == 0) ? ST_STOP1: (CR_RW == 1) ? ST_READ : ST_HOLD2 ;
+                            SCL_NEXT     = (length_reg == 0) ? 1 : 0;
+                            addr_sig_next = 1'b0;
+                            length_next = length_reg - 1;
+                        end else begin
+                            SCL_NEXT   = 1;
+                            next_state = ST_STOP1;
+                        end
+                    end else begin
+                        data_cnt_next = data_cnt_reg + 1;
+                    end
+                    if (data_cnt_reg == 1) ACK_LOW_NEXT = SDA;
+                end else begin
+                    clk_counter_next = clk_counter_reg + 1;
+                end
+            end
+            ST_WRITE_ACK: begin
+                if ((data_cnt_reg == 3)) begin
+                    SDA_EN = 1'b1;
+                end else begin
+                    SDA_EN = 1'b0;
+                end
+                O_SDA  = 1'b1;
+                if (clk_counter_reg == 249) begin
+                    SCL_NEXT = (data_cnt_reg == 0 || data_cnt_reg == 2) ? ~SCL_NEXT : SCL_NEXT;
+                    clk_counter_next = 0;
+                    if (data_cnt_reg == 3) begin
+                        data_cnt_next = 0;
+                        tx_done_next  = 1;
+                        if (!ACK_LOW_REG) begin
+                            if (length_reg == 0) begin
+                                SCL_NEXT   = 1;
+                                next_state = ST_HOLD;
+                            end else begin
+                                tx_data_next = tx_data;
+                                SCL_NEXT     = 0;
+                                next_state   = ST_HOLD2;
+                                length_next  = length_reg - 1;
+                            end
+                        end else begin
+                            SCL_NEXT   = 1;
+                            next_state = ST_STOP1;
+                        end
+                    end else begin
+                        data_cnt_next = data_cnt_reg + 1;
+                    end
+                    if (data_cnt_reg == 1) ACK_LOW_NEXT = SDA;
+                end else begin
+                    clk_counter_next = clk_counter_reg + 1;
+                end
+            end
+            ST_READ_ACK: begin
+                if (data_cnt_reg == 3) begin
+                    SDA_EN = 1'b0;
+                end else begin
+                    SDA_EN = 1'b1;
+                end
+                O_SDA  = (length_reg == 0) ? 1'b1 : 1'b0;  // nack : ack
+                if (clk_counter_reg == 249) begin
+                    SCL_NEXT = (data_cnt_reg == 0 || data_cnt_reg == 2) ? ~SCL_NEXT : SCL_NEXT;
+                    clk_counter_next = 0;
+                    if (data_cnt_reg == 3) begin
+                        data_cnt_next = 0;
+                        rx_done_next  = 1;
+                        if (length_reg == 0) begin
+                            next_state = ST_HOLD;
+                        end else begin
+                            SCL_NEXT    = 0;
+                            next_state  = ST_READ;
+                            length_next = length_reg - 1;
+                        end
+                    end else begin
+                        data_cnt_next = data_cnt_reg + 1;
+                    end
+                end else begin
+                    clk_counter_next = clk_counter_reg + 1;
+                end
+            end
+            ST_STOP1: begin
+                O_SDA = 0;
+                if (clk_counter_reg == 499) begin
+                    clk_counter_next = 0;
+                    next_state = ST_STOP2;
+                    SCL_NEXT = 1;
+                end else begin
+                    clk_counter_next = clk_counter_reg + 1;
+                end
+            end
+            ST_STOP2: begin
+                O_SDA = 1;
+                if (clk_counter_reg == 499) begin
+                    clk_counter_next = 0;
+                    next_state = ST_IDLE;
+                    SCL_NEXT = 1'b1;
+                end else begin
+                    clk_counter_next = clk_counter_reg + 1;
+                end
+            end
+        endcase
+    end
+endmodule
+```
+
+</details>
+
+<details>
+  <summary><b>Click to expand RTL (I2C_SLAVE)</b></summary>
+
+```systemverilog
+`timescale 1ns / 1ps
+
+module I2C_SLAVE (
+    // global signals
+    input  logic       clk,
+    input  logic       reset,
+    // Internal signals
+    input  logic [7:0] tx_data,
+    output logic       tx_done,
+    output logic       tx_ready,
+    output logic [7:0] rx_data,
+    output logic       rx_done,
+    // External signals
+    input  logic       scl,
+    inout  logic       sda
+);
+
+    logic sda_en;
+    logic o_sda;
+    logic [7:0] addr_reg, addr_next;
+    logic [7:0] rx_data_reg, rx_data_next;
+    logic [7:0] tx_data_reg, tx_data_next;
+    logic burst_read_reg, burst_read_next;
+    
+    ///////////////////////synchronizer && edge detector////////////////////////////////
+    logic sda_falling, sda_rising;
+    logic scl_falling, scl_rising;
+    logic sda_sync0, sda_sync1;
+    logic scl_sync0, scl_sync1;
+
+    always_ff @(posedge clk, posedge reset) begin
+        if (reset) begin
+            sda_sync0 <= 0;
+            sda_sync1 <= 0;
+            scl_sync0 <= 0;
+            scl_sync1 <= 0;
+        end else begin
+            sda_sync0 <= sda;
+            sda_sync1 <= sda_sync0;
+            scl_sync0 <= scl;
+            scl_sync1 <= scl_sync0;
+        end
+    end
+
+    assign sda_rising  = sda_sync0 && (~sda_sync1);
+    assign sda_falling = (~sda_sync0) && sda_sync1;
+    assign scl_rising  = scl_sync0 && (~scl_sync1);
+    assign scl_falling = (~scl_sync0) && scl_sync1;
+    ////////////////////////////////////////////////////////////////////////////////////
+
+    assign sda         = (sda_en) ? o_sda : 1'bz;
+
+    typedef enum {
+        IDLE,
+        ADDR,
+        SEND_ACK,
+        WAIT,
+        SEND_DATA,
+        RCV_DATA,
+        RCV_ACK,
+        RCV_ACK_HOLD,
+        WAIT_2,
+        SEND_ACK_2,
+        STOP
+    } state_e;
+
+    state_e state, state_next;
+
+    logic [2:0] bit_cnt_reg, bit_cnt_next;
+    logic rx_done_reg, rx_done_next;
+    wire [6:0] slave_addr = 7'b1111110;
+
+    always_ff @(posedge clk, posedge reset) begin
+        if (reset) begin
+            state          <= IDLE;
+            bit_cnt_reg    <= 0;
+            addr_reg       <= 0;
+            rx_data_reg    <= 0;
+            rx_done_reg    <= 0;
+            tx_data_reg    <= 0;
+            burst_read_reg <= 0;
+        end else begin
+            state          <= state_next;
+            bit_cnt_reg    <= bit_cnt_next;
+            addr_reg       <= addr_next;
+            rx_data_reg    <= rx_data_next;
+            rx_done_reg    <= rx_done_next;
+            tx_data_reg    <= tx_data_next;
+            burst_read_reg <= burst_read_next;
+
+        end
+    end
+
+    always_comb begin
+        state_next      = state;
+        bit_cnt_next    = bit_cnt_reg;
+        addr_next       = addr_reg;
+        rx_data_next    = rx_data_reg;
+        rx_done_next    = 0;
+        o_sda           = 1'b1;
+        tx_data_next    = tx_data_reg;
+        burst_read_next = burst_read_reg;
+        tx_done         = 0;
+
+        if (state != IDLE) begin
+            if (scl_sync1 && sda_rising) begin
+                state_next = STOP;
+            end else if (scl_sync1 && sda_falling) begin
+                state_next   = ADDR;
+                bit_cnt_next = 0;
+            end
+        end
+        case (state)
+            IDLE: begin
+                rx_data_next = 0;
+                if (scl && sda_falling) begin
+                    bit_cnt_next = 0;
+                    state_next   = ADDR;
+                end
+            end
+            ADDR: begin
+                if (scl_rising) begin
+                    addr_next = {addr_reg[6:0], sda};
+                    if (bit_cnt_reg == 7) begin
+                        state_next   = WAIT;
+                        rx_done_next = 1;
+                        bit_cnt_next = 0;
+                    end else begin
+                        bit_cnt_next = bit_cnt_reg + 1;
+                    end
+                end
+            end
+            WAIT: begin
+                if (scl_falling) begin
+                    state_next = SEND_ACK;
+                end
+            end
+            SEND_ACK: begin
+                if (addr_reg[7:1] == slave_addr) begin
+                    o_sda = 0;
+                end
+                if (scl_falling) begin
+                    if (addr_reg[7:1] == slave_addr) begin
+                        addr_next = 0;
+                        if (addr_reg[0]) begin
+                            state_next   = SEND_DATA;
+                            tx_data_next = tx_data;
+                        end else begin
+                            state_next = RCV_DATA;
+                        end
+                    end else begin
+                        state_next = STOP;
+                    end
+                end
+            end
+            RCV_DATA: begin
+                if (scl_rising) begin
+                    rx_data_next = {rx_data_reg[6:0], sda};
+                    if (bit_cnt_reg == 7) begin
+                        state_next   = WAIT_2;
+                        bit_cnt_next = 0;
+                    end else begin
+                        bit_cnt_next = bit_cnt_reg + 1;
+                    end
+                end
+            end
+            WAIT_2: begin
+                if (scl_falling) begin
+                    state_next = SEND_ACK_2;
+                end
+            end
+            SEND_ACK_2: begin
+                o_sda = 0;
+                if (scl_falling) begin
+                    rx_done_next = 1'b1;
+                    rx_data_next = 0;
+                    state_next   = RCV_DATA;
+                end
+            end
+            SEND_DATA: begin
+                o_sda = tx_data_reg[7];
+                if (scl_falling) begin
+                    if (bit_cnt_reg == 7) begin
+                        state_next = RCV_ACK;
+                        tx_done    = 1;
+                    end else begin
+                        tx_data_next = {tx_data_reg[6:0], 1'b0};
+                        bit_cnt_next = bit_cnt_reg + 1;
+                    end
+                end
+            end
+            RCV_ACK: begin
+                if (scl_rising) begin
+                    state_next = RCV_ACK_HOLD;
+                    if (!sda_sync1) begin
+                        burst_read_next = 1;
+                        bit_cnt_next = 0;
+                    end else begin
+                        burst_read_next = 0;
+                        bit_cnt_next = 0;
+                    end
+                end
+            end
+            RCV_ACK_HOLD: begin
+                if (scl_falling) begin
+                    if (burst_read_reg) begin
+                        state_next   = SEND_DATA;
+                        tx_data_next = tx_data;
+                    end
+                end
+            end
+            STOP: begin
+                rx_data_next = 0;
+                state_next   = IDLE;
+            end
+        endcase
+    end
+
+    assign sda_en  = (state == SEND_ACK) || (state == SEND_ACK_2) || (state == SEND_DATA);
+    assign rx_done = rx_done_reg;
+    assign rx_data = rx_data_reg;
+
+endmodule
+```
 
 </details>
 
 ---
 
-## DOC / REFERENCES
+## 13. Block Diagrams (Optional)
 
-## 12. My Docs (Images)
+> 아래처럼 이미지 넣고 싶으면, repo에 파일 넣고 경로만 맞추면 됨:
+>
+> - `docs/i2c_protocol.png`
+> - `docs/i2c_timing.png`
+> - `docs/i2c_master_asm.png`
 
-> 아래 파일명을 맞춰 `docs/` 폴더에 넣으면 README에서 바로 렌더링됩니다.
+<p align="center">
+  <img src="docs/i2c_protocol.png" width="85%">
+</p>
+<p align="center">
+  <img src="docs/i2c_timing.png" width="85%">
+</p>
+<p align="center">
+  <img src="docs/i2c_master_asm.png" width="85%">
+</p>
 
-- `docs/i2c_protocol.png`
-- `docs/i2c_timing.png`
-- `docs/i2c_master_asm.png`
+---
 
-예시:
-```md
-![I2C Protocol](docs/i2c_protocol.png)
-![I2C Timing](docs/i2c_timing.png)
-![I2C Master ASM](docs/i2c_master_asm.png)
+## DOC
+
+## 14. References
+
+### (A) Official I2C Specification
+- [NXP UM10204 — I2C-bus specification and user manual (PDF)](https://www.nxp.com/docs/en/user-guide/UM10204.pdf)
+
+### (B) “타사 제품/상용 SoC에 들어가는” I2C Controller 문서 예시 (공개 문서)
+> 상용 IP의 “풀 유저가이드”는 보통 NDA라 공개가 제한적이라, 공개 접근 가능한 형태로는 Linux DT binding / driver 문서가 가장 현실적인 레퍼런스임.
+
+- [Synopsys DesignWare I2C (DT binding, text)](https://www.kernel.org/doc/Documentation/devicetree/bindings/i2c/i2c-designware.txt)
+- [Synopsys DesignWare I2C (DT binding, YAML)](https://www.kernel.org/doc/Documentation/devicetree/bindings/i2c/snps%2Cdesignware-i2c.yaml)
+- [Cadence I2C Controller (DT binding, text)](https://www.kernel.org/doc/Documentation/devicetree/bindings/i2c/i2c-cadence.txt)
+
+### (C) Example: 실제 플랫폼 문서에서 DesignWare 사용 언급(공개)
+- [Altera/Intel HPS I2C (DesignWare controller instances 언급)](https://altera-fpga.github.io/rel-24.1/linux-embedded/i2c/i2c/)
+
